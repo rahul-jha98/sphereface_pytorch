@@ -78,7 +78,7 @@ class AngleLoss(nn.Module):
 
     def forward(self, input, target):
         self.it += 1
-        cos_theta, _ = input
+        cos_theta = input
         target = target.view(-1,1) #size=(B,1)
 
         index = cos_theta.data * 0.0 #size=(B,Classnum)
