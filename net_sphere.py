@@ -52,29 +52,54 @@ class AngleLinear(nn.Module):
             phi_theta = phi_theta.clamp(-1*self.m,1)
 
         cos_theta = cos_theta * xlen.view(-1,1)
-        phi_theta = phi_theta * xlen.view(-1,1)
-        output = (cos_theta,phi_theta)
-        return output # size=(B,Classnum,2)
+
+
+        return (cos_theta, cos_theta) # size=(B,Classnum,2)
 
 
 class AngleLoss(nn.Module):
-    def __init__(self, gamma=0):
+    def __init__(self, gamma=0, m = 4, phiflag = True):
         super(AngleLoss, self).__init__()
         self.gamma   = gamma
         self.it = 0
         self.LambdaMin = 5.0
         self.LambdaMax = 1500.0
         self.lamb = 1500.0
+        self.phiflag = phiflag
+        self.m = m
+        self.mlambda = [
+            lambda x: x**0,
+            lambda x: x**1,
+            lambda x: 2*x**2-1,
+            lambda x: 4*x**3-3*x,
+            lambda x: 8*x**4-8*x**2+1,
+            lambda x: 16*x**5-20*x**3+5*x
+        ]
 
     def forward(self, input, target):
         self.it += 1
-        cos_theta,phi_theta = input
+        cos_theta, _ = input
         target = target.view(-1,1) #size=(B,1)
 
         index = cos_theta.data * 0.0 #size=(B,Classnum)
         index.scatter_(1,target.data.view(-1,1),1)
         index = index.byte()
         index = Variable(index)
+
+
+        if self.phiflag:
+            cos_m_theta = self.mlambda[self.m](cos_theta)
+            theta = Variable(cos_theta.data.acos())
+            k = (self.m*theta/3.14159265).floor()
+            n_one = k*0.0 - 1
+            phi_theta = (n_one**k) * cos_m_theta - 2*k
+        else:
+            theta = cos_theta.acos()
+            phi_theta = myphi(theta,self.m)
+            phi_theta = phi_theta.clamp(-1*self.m,1)
+
+        
+        phi_theta = phi_theta
 
         self.lamb = max(self.LambdaMin,self.LambdaMax/(1+0.1*self.it ))
         output = cos_theta * 1.0 #size=(B,Classnum)
@@ -90,13 +115,12 @@ class AngleLoss(nn.Module):
         loss = loss.mean()
 
         return loss
+    
 
-
-class sphere20a(nn.Module):
-    def __init__(self,classnum=10574,feature=False):
-        super(sphere20a, self).__init__()
-        self.classnum = classnum
-        self.feature = feature
+class resnet(nn.Module):
+    def __init__(self):
+        super(resnet, self).__init__()
+        
         #input = B*3*112*96
         self.conv1_1 = nn.Conv2d(3,64,3,2,1) #=>B*64*56*48
         self.relu1_1 = nn.PReLU(64)
@@ -148,7 +172,6 @@ class sphere20a(nn.Module):
         self.relu4_3 = nn.PReLU(512)
 
         self.fc5 = nn.Linear(512*7*6,512)
-        self.fc6 = AngleLinear(512,self.classnum)
 
 
     def forward(self, x):
@@ -170,7 +193,91 @@ class sphere20a(nn.Module):
 
         x = x.view(x.size(0),-1)
         x = self.fc5(x)
-        if self.feature: return x
-
-        x = self.fc6(x)
         return x
+
+
+class sphere20a(nn.Module):
+    def __init__(self,classnum=10574,feature=False):
+        super(sphere20a, self).__init__()
+        self.classnum = classnum
+        self.feature = feature
+        #input = B*3*112*96
+        self.resnet = resnet()
+        self.angleLayer = AngleLinear(512,self.classnum)
+
+
+    def forward(self, x):
+        x = self.resnet(x)
+        if self.feature: return x
+        x = self.angleLayer(x)
+        return x
+    
+#-------------------------------Regular face-----------------------------------------------------------------------
+    
+class AngleLayer(nn.Module):
+
+  def __init__(self, feat_dim=512, num_class=10572, norm_data=True, radius=1):
+    super(AngleLayer, self).__init__()
+    self.num_class = num_class
+    self.feat_dim = feat_dim
+    self.norm_data = norm_data
+    self.radius = float(radius)
+    self.weight = nn.Parameter(torch.randn(self.num_class, self.feat_dim))
+    self.reset_parameters()
+
+  def reset_parameters(self):
+    stdv = 1. / math.sqrt(self.weight.size(1))
+    self.weight.data.uniform_(-stdv, stdv)
+
+  def forward(self, x):
+
+    weight_norm = torch.nn.functional.normalize(self.weight, p=2, dim=1)
+    cos = torch.mm(weight_norm, weight_norm.t())
+    cos.clamp(-1, 1)
+
+    cos1 = cos.detach()
+    cos1.scatter_(1, torch.arange(self.num_class).view(-1, 1).long().cuda(), -100)
+
+    _, indices = torch.max(cos1, dim=0)
+    mask = torch.zeros((self.num_class, self.num_class)).cuda()
+    mask.scatter_(1, indices.view(-1, 1).long(), 1)
+    
+    exclusive_loss = torch.dot(cos.view(cos.numel()), mask.view(mask.numel())) / self.num_class
+    
+    if self.norm_data:
+      x = torch.nn.functional.normalize(x, p=2, dim=1)
+      x = x * self.radius
+
+    return torch.nn.functional.linear(x, weight_norm), exclusive_loss
+    
+
+class SphereAndRgularLoss(nn.Module):
+    def __init__(self, lamb = 6):
+        super(SphereAndRgularLoss, self).__init__()
+        self.lamb = lamb
+        self.angular = AngleLoss()
+        self.loss = 0
+        self.regularLoss = 0
+
+    @property
+    def it(self):      return self.angular.it
+
+    def forward(self, input, target):
+        loss = self.angular(input[0], target)
+        regularLoss = input[1]
+        # print(regularLoss)
+
+        self.loss = loss.detach()
+        self.regularLoss = regularLoss.detach()
+        return loss + self.lamb * regularLoss
+
+class regularNet(nn.Module):
+    def __init__(self, out_features = 10574):
+      super(regularNet, self).__init__()
+      self.resnet =  resnet()
+      self.special = AngleLayer(512, out_features)
+
+    def forward(self, x):
+      x = self.resnet(x)
+      y = self.special(x)
+      return y
